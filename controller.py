@@ -1,3 +1,4 @@
+import os
 import numpy as np
 import torch
 import abc
@@ -70,7 +71,12 @@ class VectorStore(VectorControl):
                 # and we'll use it for all the steps of generation
                 # if steering vectors are from full version, then there's a key in self.steering_vectors
                 # for each of the generation steps 
-                num_steer = 0 if len(list(self.steering_vectors.keys()))==1 else self.cur_step
+                keys = sorted(self.steering_vectors.keys())
+                if len(keys) == 1:
+                    num_steer = keys[0]
+                else:
+                    max_key = keys[-1]
+                    num_steer = min(self.cur_step, max_key)
 
                 steering_vector = self.steering_vectors[num_steer][place_in_unet][len(self.step_store[place_in_unet])]
                 steering_vector = torch.tensor(steering_vector).to(self.device).view(1, 1, -1)
