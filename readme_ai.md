@@ -70,7 +70,7 @@ python compute_steering_vectors_sana.py \
 # Mode C: Per-concept bank — multiple concepts from different modes, each averaged across many prompts
 python compute_steering_vectors_sana.py \
     --averaging per_concept_bank \
-    --num_concepts 20 \
+    --num_concepts 10 \
     --num_denoising_steps 20 \
     --hook_point cross_attn \
     --save_dir steering_vectors_sana

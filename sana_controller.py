@@ -84,22 +84,24 @@ class SanaVectorStore(VectorControl):
                     num_steer = min(self.cur_step, max_key)
 
                 steering_vector = self.steering_vectors[num_steer]["layers"][layer_idx]
-                steering_vector = torch.tensor(steering_vector).to(self.device).view(1, 1, -1)
+                steering_vector = torch.tensor(steering_vector, dtype=vector.dtype, device=self.device).view(1, 1, -1)
 
-                norm = torch.norm(vector, dim=2, keepdim=True)
+                # Skip if steering vector is NaN or zero
+                if not (torch.isnan(steering_vector).any() or steering_vector.abs().sum() == 0):
+                    norm = torch.norm(vector, dim=2, keepdim=True)
 
-                if self.steer_back:
-                    sim = torch.tensordot(vector, steering_vector,
-                                          dims=([2], [2])).view(vector.size()[0], vector.size()[1], 1)
-                    sim = torch.where(sim > 0, sim, 0)
-                    vector = vector - (self.beta * sim) * steering_vector.expand(1, vector.size()[1], -1)
-                else:
-                    alpha = self._get_alpha()
-                    vector = vector + alpha * steering_vector.expand(1, vector.size()[1], -1)
+                    if self.steer_back:
+                        sim = torch.tensordot(vector, steering_vector,
+                                              dims=([2], [2])).view(vector.size()[0], vector.size()[1], 1)
+                        sim = torch.where(sim > 0, sim, 0)
+                        vector = vector - (self.beta * sim) * steering_vector.expand(1, vector.size()[1], -1)
+                    else:
+                        alpha = self._get_alpha()
+                        vector = vector + alpha * steering_vector.expand(1, vector.size()[1], -1)
 
-                # Renormalize
-                vector = vector / torch.norm(vector, dim=2, keepdim=True)
-                vector = vector * norm
+                    # Renormalize
+                    vector = vector / torch.norm(vector, dim=2, keepdim=True)
+                    vector = vector * norm
 
         # Save activation for computing steering vectors
         self.step_store["layers"].append(

@@ -127,7 +127,11 @@ def compute_sv(pos_vectors, neg_vectors, num_denoising_steps):
                 for i in range(len(neg_vectors))
             ], axis=0)
             sv = pos_avg - neg_avg
-            sv = sv / np.linalg.norm(sv)
+            norm = np.linalg.norm(sv)
+            if np.isfinite(norm) and norm > 1e-8:
+                sv = sv / norm
+            else:
+                sv = np.zeros_like(sv)
             steering_vectors[denoising_step]["layers"].append(sv)
 
     return steering_vectors
