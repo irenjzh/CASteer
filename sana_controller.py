@@ -112,7 +112,7 @@ class SanaVectorStore(VectorControl):
         self.step_store = self.get_empty_store()
 
 
-def register_vector_control_sana(model, controller, hook_point="cross_attn"):
+def     register_vector_control_sana(model, controller, hook_point="cross_attn"):
     """
     Register steering vector controller for SANA transformer.
 

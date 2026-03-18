@@ -30,7 +30,7 @@ pip install sentencepiece  # for Gemma tokenizer
 | File | Description |
 |------|-------------|
 | `sana_controller.py` | Controller adapted for SANA (flat transformer blocks) |
-| `compute_steering_vectors_sana.py` | Compute steering vectors: multi-concept bank or per-concept averaged (like SD) |
+| `compute_steering_vectors_sana.py` | Compute steering vectors: multi-concept bank, per-concept averaged (like SD), or per-concept bank (mixed modes) |
 | `generate_sana_diverse.py` | Generate images with random steering for diversity |
 | `evaluate_sana.py` | Evaluate quality (CLIPScore, PickScore, ImageReward) and diversity (MPS, Vendi) |
 
@@ -66,6 +66,34 @@ python compute_steering_vectors_sana.py \
 
 # Output:
 #   steering_vectors_sana/sana_cross_attn_anime_None.pickle
+
+# Mode C: Per-concept bank — multiple concepts from different modes, each averaged across many prompts
+python compute_steering_vectors_sana.py \
+    --averaging per_concept_bank \
+    --num_concepts 20 \
+    --num_denoising_steps 20 \
+    --hook_point cross_attn \
+    --save_dir steering_vectors_sana
+
+# Output:
+#   steering_vectors_sana/sana_cross_attn_per_concept_bank.pickle
+# Bank format: {"concept_name": {step: {"layers": [...]}}}
+# Default concepts: anime, watercolor, oil painting, pixel art, sketch, photorealistic,
+#                   Snoopy, sunglasses, hat, flowers, snow, fire
+
+# Mode C with custom concepts file:
+python compute_steering_vectors_sana.py \
+    --averaging per_concept_bank \
+    --concepts_file concepts.txt \
+    --num_concepts 20 \
+    --hook_point cross_attn \
+    --save_dir steering_vectors_sana
+
+# concepts.txt format (one per line: concept,mode):
+#   anime,style
+#   watercolor,style
+#   Snoopy,concrete
+#   smiling,human-related
 ```
 
 ### Step 2: Generate Baseline Images
@@ -128,10 +156,17 @@ python generate_sana_diverse.py \
     --save_dir sana_diverse_outputs
 ```
 
+```bash
 # Using per-concept averaged SV (single concept, like SD):
 python generate_sana_diverse.py \
     --strategy all_layers --hook_point cross_attn --alpha 10 \
     --sv_path steering_vectors_sana/sana_cross_attn_anime_None.pickle \
+    --save_dir sana_diverse_outputs
+
+# Using per-concept bank (random concept per seed, each concept averaged across many prompts):
+python generate_sana_diverse.py \
+    --strategy all_layers --hook_point cross_attn --alpha 10 \
+    --sv_bank_path steering_vectors_sana/sana_cross_attn_per_concept_bank.pickle \
     --save_dir sana_diverse_outputs
 ```
 
@@ -186,8 +221,11 @@ python evaluate_sana.py \
 |------|-------------|---------|
 | `multi_concept` (default) | Many ImageNet concepts, one prompt each → diversity bank | `--averaging multi_concept` |
 | `per_concept` | One concept, many prompts averaged (like SD) → single SV | `--averaging per_concept --concept_pos anime --prompt_mode style` |
+| `per_concept_bank` | Multiple concepts from different modes (style, concrete, human-related), each averaged across many prompts → named concept bank | `--averaging per_concept_bank` |
 
 **`per_concept`** reuses the same prompt templates as the SD pipeline (`style`, `concrete`, `human-related` from `construct_prompts.py`). The `--num_concepts` parameter controls how many ImageNet subjects are used as prompt variations (default 50). In generation, use `--sv_path` instead of `--sv_bank_path` to load the single averaged SV.
+
+**`per_concept_bank`** combines the best of both modes: each concept gets a high-quality averaged steering vector (like `per_concept`), but the result is a bank of multiple concepts (like `multi_concept`). Concepts span different modes — style (anime, watercolor, ...), concrete (Snoopy, sunglasses, ...), and human-related. During generation, a random concept is picked per seed. The default concept list can be overridden with `--concepts_file`. In generation, use `--sv_bank_path` to load the bank.
 
 ## Test Prompts (10)
 
@@ -220,7 +258,7 @@ python evaluate_sana.py \
 
 ## Model Info
 
-- **SANA 600M 512px**: `Efficient-Large-Model/Sana_600M_512px_BF16_diffusers`
+- **SANA 600M 512px**: `Efficient-Large-Model/Sana_600M_512px_diffusers`
 - Fits in T4 16GB (Colab free tier)
 - 20 transformer blocks, inner_dim=2240
 - Text encoder: Gemma2 (2304 caption channels)
