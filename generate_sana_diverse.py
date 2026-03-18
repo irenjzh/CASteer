@@ -12,7 +12,7 @@ from sana_controller import SanaVectorStore, register_vector_control_sana
 import argparse
 parser = argparse.ArgumentParser()
 parser.add_argument('--model_id', type=str,
-                    default='Efficient-Large-Model/Sana_600M_512px_BF16_diffusers')
+                    default='Efficient-Large-Model/Sana_600M_512px_diffusers')
 parser.add_argument('--sv_bank_path', type=str, default=None,
                     help='Path to concept bank pickle (multi_concept mode)')
 parser.add_argument('--sv_path', type=str, default=None,

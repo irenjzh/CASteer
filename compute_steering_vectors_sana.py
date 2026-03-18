@@ -18,7 +18,7 @@ parser.add_argument('--save_dir', type=str, default='steering_vectors_sana')
 parser.add_argument('--hook_point', type=str, default='cross_attn',
                     choices=['cross_attn', 'self_attn', 'residual'])
 parser.add_argument('--model_id', type=str,
-                    default='Efficient-Large-Model/Sana_600M_512px_BF16_diffusers')
+                    default='Efficient-Large-Model/Sana_600M_512px_diffusers')
 parser.add_argument('--averaging', type=str, default='multi_concept',
                     choices=['multi_concept', 'per_concept'],
                     help='multi_concept: many concepts, one prompt each (for diversity bank). '
@@ -35,11 +35,20 @@ args = parser.parse_args()
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
 # Load SANA pipeline
-pipe = SanaPipeline.from_pretrained(
-    args.model_id,
-    torch_dtype=torch.float16,
-    cache_dir='./cache'
-)
+try:
+    pipe = SanaPipeline.from_pretrained(
+        args.model_id,
+        torch_dtype=torch.float16,
+        cache_dir='./cache'
+    )
+except OSError:
+    print("Could not fetch from Hub, loading from local cache...")
+    pipe = SanaPipeline.from_pretrained(
+        args.model_id,
+        torch_dtype=torch.float16,
+        cache_dir='./cache',
+        local_files_only=True
+    )
 pipe.to(device)
 
 # Build positive/negative prompt pairs depending on averaging mode
