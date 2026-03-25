@@ -1,5 +1,3 @@
-
-
 def get_imagenet_classes(num=50):
     imagenet_classes = []
     

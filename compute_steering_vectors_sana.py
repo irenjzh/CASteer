@@ -71,7 +71,7 @@ DEFAULT_BANK_CONCEPTS = [
 ]
 
 
-def build_prompts(mode, concept_pos, num_prompts, concept_neg=None):
+def build_prompts(mode, concept_pos, num_prompts = 50, concept_neg=None):
     if mode == 'concrete':
         return get_prompts_concrete(num=num_prompts, concept_pos=concept_pos, concept_neg=concept_neg)
     elif mode == 'style':
@@ -155,7 +155,7 @@ if args.averaging == 'per_concept_bank':
     concept_bank = {}
     for idx, (concept, mode) in enumerate(concepts):
         print(f'\n=== [{idx+1}/{len(concepts)}] Concept: "{concept}" (mode={mode}) ===')
-        prompts_pos, prompts_neg = build_prompts(mode, concept, args.num_concepts)
+        prompts_pos, prompts_neg = build_prompts(mode, concept)
         pos_vecs, neg_vecs = collect_activations(
             pipe, prompts_pos, prompts_neg, args.num_denoising_steps, args.hook_point, device)
         concept_bank[concept] = compute_sv(pos_vecs, neg_vecs, args.num_denoising_steps)

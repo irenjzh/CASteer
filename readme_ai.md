@@ -57,7 +57,6 @@ python compute_steering_vectors_sana.py \
 python compute_steering_vectors_sana.py \
     --averaging per_concept \
     --concept_pos anime \
-    --concept_neg None \
     --prompt_mode style \
     --num_concepts 50 \
     --num_denoising_steps 20 \
