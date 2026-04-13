@@ -102,7 +102,7 @@ class SanaVectorStore(VectorControl):
                     # Renormalize
                     vector = vector / torch.norm(vector, dim=2, keepdim=True)
                     vector = vector * norm
-
+# для чего обрабатывать этот случай и нормировать 
         # Save activation for computing steering vectors
         self.step_store["layers"].append(
             vector.data.cpu().numpy()[len(vector) // 2:].mean(axis=0).mean(axis=0)
@@ -114,7 +114,7 @@ class SanaVectorStore(VectorControl):
         self.step_store = self.get_empty_store()
 
 
-def     register_vector_control_sana(model, controller, hook_point="cross_attn"):
+def register_vector_control_sana(model, controller, hook_point="cross_attn"):
     """
     Register steering vector controller for SANA transformer.
 
