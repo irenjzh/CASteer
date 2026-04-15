@@ -588,7 +588,12 @@ def _is_prompt_complete(experiment_dir: str, prompt_index: int, seeds: Sequence[
     return all(os.path.exists(_prompt_image_path(experiment_dir, prompt_index, seed)) for seed in seeds)
 
 
-def _save_prompt_metadata(prompt_dir: str, record: Dict[str, Any], concept_names: Sequence[str]) -> None:
+def _save_prompt_metadata(
+    prompt_dir: str,
+    record: Dict[str, Any],
+    concept_names: Sequence[str],
+    chosen_concepts: Optional[Dict[str, Optional[str]]] = None,
+) -> None:
     save_json(
         os.path.join(prompt_dir, 'metadata.json'),
         {
@@ -600,6 +605,8 @@ def _save_prompt_metadata(prompt_dir: str, record: Dict[str, Any], concept_names
             'concept_names': list(concept_names),
         },
     )
+    if chosen_concepts is not None:
+        save_json(os.path.join(prompt_dir, 'chosen_concepts.json'), chosen_concepts)
 
 
 def generate_images_for_manifest(
@@ -627,22 +634,47 @@ def generate_images_for_manifest(
 
     for record in manifest:
         prompt_dir = ensure_dir(_prompt_dir(experiment_dir, record['prompt_index']))
+        chosen_concepts: Dict[str, Optional[str]] = {}
         with open(os.path.join(prompt_dir, 'prompt.txt'), 'w', encoding='utf-8') as f:
             f.write(record['caption'])
 
         if _is_prompt_complete(experiment_dir, record['prompt_index'], record['seeds']):
-            _save_prompt_metadata(prompt_dir, record, concept_names)
+            chosen_concepts_path = os.path.join(prompt_dir, 'chosen_concepts.json')
+            if os.path.exists(chosen_concepts_path):
+                chosen_concepts = load_json(chosen_concepts_path)
+            elif concept_bank is not None:
+                chosen_concepts = {
+                    str(seed): choose_concept_name(
+                        concept_names=concept_names,
+                        prompt_index=record['prompt_index'],
+                        seed=seed,
+                        concept_seed=concept_seed,
+                    )
+                    for seed in record['seeds']
+                }
+            _save_prompt_metadata(prompt_dir, record, concept_names, chosen_concepts)
             continue
 
         for seed in record['seeds']:
             image_path = _prompt_image_path(experiment_dir, record['prompt_index'], seed)
             if os.path.exists(image_path):
+                chosen_concepts[str(seed)] = (
+                    choose_concept_name(
+                        concept_names=concept_names,
+                        prompt_index=record['prompt_index'],
+                        seed=seed,
+                        concept_seed=concept_seed,
+                    )
+                    if concept_bank is not None
+                    else None
+                )
                 continue
 
             chosen_concept = None
             if baseline:
                 controller = SanaVectorStore(device=device)
                 controller.steer = False
+                chosen_concepts[str(seed)] = None
             else:
                 selected_vectors = steering_vectors
                 if concept_bank is not None:
@@ -653,6 +685,7 @@ def generate_images_for_manifest(
                         concept_seed=concept_seed,
                     )
                     selected_vectors = concept_bank[chosen_concept]
+                chosen_concepts[str(seed)] = chosen_concept
 
                 controller = SanaVectorStore(
                     steering_vectors=selected_vectors,
@@ -677,7 +710,7 @@ def generate_images_for_manifest(
             else:
                 print(f'[prompt={record["prompt_index"]:04d}] seed={seed:02d} -> {image_path}')
 
-        _save_prompt_metadata(prompt_dir, record, concept_names)
+        _save_prompt_metadata(prompt_dir, record, concept_names, chosen_concepts)
     return experiment_dir
 
 
