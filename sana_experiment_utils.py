@@ -32,7 +32,7 @@ MODEL_REGISTRY = {
 
 DEFAULT_SEEDS = [0, 1, 2, 3, 4]
 DEFAULT_HOOK_POINTS = ['cross_attn', 'self_attn', 'residual']
-ALPHAS_P1 = [0.1, 0.3, 0.5, 0.8, 1.1, 1.4]
+ALPHAS_P1 = [0.1, 0.7, 1.4]
 ALPHAS_P2_MASTER = [0.05, 0.1, 0.2, 0.3, 0.5, 0.8, 1.1, 1.4]
 VALIDATION_METRICS = ['clip_score', 'fid']
 TEST_METRICS = ['clip_score', 'pick_score', 'image_reward', 'mps', 'vendi']
@@ -1044,14 +1044,14 @@ def run_validation_sweep(
     ensure_dir(output_root)
 
     for hook_point in hook_points:
-        concept_bank, bank_path = load_or_compute_concept_bank(
+        concept_bank, bank_path = load_or_compute_concept_bank(        
             pipe=pipe,
             hook_point=hook_point,
             bank_mode=bank_mode,
             num_concepts=num_concepts,
             num_denoising_steps=num_denoising_steps,
             bank_dir=bank_dir,
-            device=device,
+            device=device, 
         )
         for alpha in alphas:
             variant = 'best_steering'
