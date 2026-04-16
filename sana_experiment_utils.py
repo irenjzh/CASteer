@@ -5,6 +5,7 @@ import json
 import os
 import pickle
 import random
+import re
 import shutil
 import urllib.request
 import zipfile
@@ -101,12 +102,55 @@ def resolve_model_id(model_alias: str = 'small', model_id: Optional[str] = None)
     return MODEL_REGISTRY[model_alias]
 
 
+def _safe_model_dir_name(model_alias: str, model_id: Optional[str] = None) -> str:
+    resolved_model_id = resolve_model_id(model_alias=model_alias, model_id=model_id)
+    safe_model_id = re.sub(r'[^A-Za-z0-9._-]+', '_', resolved_model_id)
+    return f'{model_alias}__{safe_model_id}'
+
+
+def ensure_sana_model_on_disk(
+    model_alias: str = 'small',
+    model_id: Optional[str] = None,
+    local_model_root: str = './models_cache',
+    cache_dir: str = './cache',
+) -> Dict[str, Any]:
+    from huggingface_hub import snapshot_download
+
+    resolved_model_id = resolve_model_id(model_alias=model_alias, model_id=model_id)
+    local_model_root = ensure_dir(local_model_root)
+    local_model_path = os.path.join(local_model_root, _safe_model_dir_name(model_alias, model_id))
+    model_index_path = os.path.join(local_model_path, 'model_index.json')
+
+    if os.path.exists(model_index_path):
+        return {
+            'model_alias': model_alias,
+            'model_id': resolved_model_id,
+            'local_model_path': local_model_path,
+            'downloaded': False,
+        }
+
+    ensure_dir(local_model_path)
+    snapshot_download(
+        repo_id=resolved_model_id,
+        local_dir=local_model_path,
+        cache_dir=cache_dir,
+    )
+    return {
+        'model_alias': model_alias,
+        'model_id': resolved_model_id,
+        'local_model_path': local_model_path,
+        'downloaded': True,
+    }
+
+
 def load_sana_pipeline(
     model_alias: str = 'small',
     model_id: Optional[str] = None,
     cache_dir: str = './cache',
     device: Optional[str] = None,
     torch_dtype: Optional[torch.dtype] = None,
+    model_path: Optional[str] = None,
+    local_model_root: Optional[str] = None,
 ):
     from diffusers import SanaPipeline
 
@@ -115,6 +159,27 @@ def load_sana_pipeline(
         torch_dtype = torch.float16 if device == 'cuda' else torch.float32
 
     resolved_model_id = resolve_model_id(model_alias=model_alias, model_id=model_id)
+    local_model_path = model_path
+    if local_model_path is None and local_model_root is not None:
+        model_info = ensure_sana_model_on_disk(
+            model_alias=model_alias,
+            model_id=model_id,
+            local_model_root=local_model_root,
+            cache_dir=cache_dir,
+        )
+        local_model_path = model_info['local_model_path']
+
+    if local_model_path is not None:
+        pipe = SanaPipeline.from_pretrained(
+            local_model_path,
+            torch_dtype=torch_dtype,
+            cache_dir=cache_dir,
+            local_files_only=True,
+        )
+        setattr(pipe, 'local_model_path', local_model_path)
+        pipe.to(device)
+        return pipe
+
     try:
         pipe = SanaPipeline.from_pretrained(
             resolved_model_id,
@@ -1060,6 +1125,43 @@ def load_cached_validation_metrics(experiment_dir: str, config: Dict[str, Any]) 
     return metrics_payload
 
 
+def _stored_config_fingerprint(config_path: str) -> Optional[str]:
+    if not os.path.exists(config_path):
+        return None
+    stored_config = load_json(config_path)
+    return stored_config.get('config_fingerprint') or make_config_fingerprint(
+        {k: v for k, v in stored_config.items() if k != 'config_fingerprint'}
+    )
+
+
+def resolve_validation_experiment_dir(
+    output_root: str,
+    variant: str,
+    hook_point: str,
+    alpha: float,
+    config_base: Dict[str, Any],
+) -> Tuple[str, str]:
+    config_fingerprint = make_config_fingerprint(config_base)
+    experiment_name = build_experiment_tag('validation', variant, hook_point, alpha)
+    canonical_dir = os.path.join(output_root, experiment_name)
+    canonical_config_path = os.path.join(canonical_dir, 'config.json')
+
+    if os.path.exists(canonical_config_path):
+        if _stored_config_fingerprint(canonical_config_path) == config_fingerprint:
+            return canonical_dir, config_fingerprint
+    else:
+        legacy_candidates = sorted(glob.glob(os.path.join(output_root, f'{experiment_name}__*')))
+        for candidate in legacy_candidates:
+            candidate_config_path = os.path.join(candidate, 'config.json')
+            if _stored_config_fingerprint(candidate_config_path) == config_fingerprint:
+                os.rename(candidate, canonical_dir)
+                return canonical_dir, config_fingerprint
+        return canonical_dir, config_fingerprint
+
+    fallback_dir = os.path.join(output_root, f'{experiment_name}__cfg_{config_fingerprint[:10]}')
+    return fallback_dir, config_fingerprint
+
+
 def save_validation_plot(rows: Sequence[Dict[str, Any]], output_path: str, title: str = 'Validation Sweep') -> str:
     import matplotlib.pyplot as plt
 
@@ -1171,12 +1273,16 @@ def run_validation_sweep(
                 'steering_bank_path': bank_path,
                 'metrics': VALIDATION_METRICS,
             }
-            config_fingerprint = make_config_fingerprint(config_base)
+            experiment_dir, config_fingerprint = resolve_validation_experiment_dir(
+                output_root=output_root,
+                variant=variant,
+                hook_point=hook_point,
+                alpha=alpha,
+                config_base=config_base,
+            )
             config = dict(config_base)
             config['config_fingerprint'] = config_fingerprint
             config_id = f'{hook_point}_a{alpha}_{config_fingerprint[:10]}'
-            experiment_name = f"{build_experiment_tag('validation', variant, hook_point, alpha)}__{config_fingerprint[:10]}"
-            experiment_dir = os.path.join(output_root, experiment_name)
 
             metrics_payload = load_cached_validation_metrics(experiment_dir, config_base)
             if metrics_payload is None:

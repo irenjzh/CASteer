@@ -23,6 +23,7 @@ def parse_args():
     parser.add_argument('--hook_point', type=str, default='cross_attn', choices=['cross_attn', 'self_attn', 'residual'])
     parser.add_argument('--model_alias', type=str, default='small', choices=['small', 'large'])
     parser.add_argument('--model_id', type=str, default=None)
+    parser.add_argument('--local_model_root', type=str, default=None)
     parser.add_argument(
         '--averaging',
         type=str,
@@ -55,7 +56,12 @@ def main():
     args = parse_args()
     os.makedirs(args.save_dir, exist_ok=True)
     device = get_device()
-    pipe = load_sana_pipeline(model_alias=args.model_alias, model_id=args.model_id, device=device)
+    pipe = load_sana_pipeline(
+        model_alias=args.model_alias,
+        model_id=args.model_id,
+        device=device,
+        local_model_root=args.local_model_root,
+    )
 
     if args.averaging == 'per_concept_bank':
         concepts = load_concepts(args)

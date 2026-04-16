@@ -28,6 +28,7 @@ def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument('--model_alias', type=str, default='small', choices=['small', 'large'])
     parser.add_argument('--model_id', type=str, default=None)
+    parser.add_argument('--local_model_root', type=str, default=None)
     parser.add_argument('--sv_bank_path', type=str, default=None)
     parser.add_argument('--sv_path', type=str, default=None)
     parser.add_argument('--num_denoising_steps', type=int, default=20)
@@ -60,7 +61,12 @@ def build_manifest(num_seeds):
 def main():
     args = parse_args()
     device = get_device()
-    pipe = load_sana_pipeline(model_alias=args.model_alias, model_id=args.model_id, device=device)
+    pipe = load_sana_pipeline(
+        model_alias=args.model_alias,
+        model_id=args.model_id,
+        device=device,
+        local_model_root=args.local_model_root,
+    )
 
     concept_bank = None
     steering_vectors = None
