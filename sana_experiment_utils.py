@@ -1,5 +1,6 @@
 import csv
 import glob
+import hashlib
 import json
 import os
 import pickle
@@ -1029,6 +1030,74 @@ def write_summary_csv(rows: Sequence[Dict[str, Any]], output_path: str) -> str:
     return output_path
 
 
+def make_config_fingerprint(config: Dict[str, Any]) -> str:
+    payload = json.dumps(config, sort_keys=True, ensure_ascii=False, default=str)
+    return hashlib.sha1(payload.encode('utf-8')).hexdigest()
+
+
+def _validation_metrics_are_complete(metrics_payload: Dict[str, Any]) -> bool:
+    aggregate = metrics_payload.get('aggregate', {})
+    return 'clip_score_mean' in aggregate and 'fid' in aggregate
+
+
+def load_cached_validation_metrics(experiment_dir: str, config: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    config_path = os.path.join(experiment_dir, 'config.json')
+    metrics_path = os.path.join(experiment_dir, 'metrics.json')
+    if not (os.path.exists(config_path) and os.path.exists(metrics_path)):
+        return None
+
+    stored_config = load_json(config_path)
+    expected_fp = make_config_fingerprint(config)
+    stored_fp = stored_config.get('config_fingerprint') or make_config_fingerprint(
+        {k: v for k, v in stored_config.items() if k != 'config_fingerprint'}
+    )
+    if stored_fp != expected_fp:
+        return None
+
+    metrics_payload = load_json(metrics_path)
+    if not _validation_metrics_are_complete(metrics_payload):
+        return None
+    return metrics_payload
+
+
+def save_validation_plot(rows: Sequence[Dict[str, Any]], output_path: str, title: str = 'Validation Sweep') -> str:
+    import matplotlib.pyplot as plt
+
+    ensure_dir(os.path.dirname(output_path) or '.')
+    grouped: Dict[str, List[Dict[str, Any]]] = {}
+    for row in rows:
+        grouped.setdefault(str(row.get('hook_point')), []).append(row)
+
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+    for hook_point, hook_rows in sorted(grouped.items()):
+        hook_rows = sorted(hook_rows, key=lambda item: float(item['alpha']))
+        alphas = [float(item['alpha']) for item in hook_rows]
+        clips = [float(item['clip_score_mean_mean']) for item in hook_rows]
+        fids = [float(item['fid']) for item in hook_rows]
+        axes[0].plot(alphas, clips, marker='o', label=hook_point)
+        axes[1].plot(alphas, fids, marker='o', label=hook_point)
+
+    axes[0].set_title('Alpha vs CLIPScore')
+    axes[0].set_xlabel('alpha')
+    axes[0].set_ylabel('CLIPScore')
+    axes[0].grid(True, alpha=0.3)
+
+    axes[1].set_title('Alpha vs FID')
+    axes[1].set_xlabel('alpha')
+    axes[1].set_ylabel('FID')
+    axes[1].grid(True, alpha=0.3)
+
+    if grouped:
+        axes[0].legend()
+        axes[1].legend()
+
+    fig.suptitle(title)
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=150, bbox_inches='tight')
+    plt.close(fig)
+    return output_path
+
+
 def smoke_test_setup(
     model_aliases: Sequence[str] = ('small', 'large'),
     hook_points: Sequence[str] = tuple(DEFAULT_HOOK_POINTS),
@@ -1088,9 +1157,7 @@ def run_validation_sweep(
         )
         for alpha in alphas:
             variant = 'best_steering'
-            config_id = f'{hook_point}_a{alpha}'
-            experiment_dir = os.path.join(output_root, build_experiment_tag('validation', variant, hook_point, alpha))
-            config = {
+            config_base = {
                 'split': 'validation',
                 'variant': variant,
                 'model_alias': model_alias,
@@ -1104,25 +1171,37 @@ def run_validation_sweep(
                 'steering_bank_path': bank_path,
                 'metrics': VALIDATION_METRICS,
             }
-            generate_images_for_manifest(
-                pipe=pipe,
-                manifest=validation_manifest,
-                experiment_dir=experiment_dir,
-                hook_point=hook_point,
-                alpha=alpha,
-                num_denoising_steps=num_denoising_steps,
-                strategy=strategy,
-                concept_bank=concept_bank,
-                device=device,
-                save_config=config,
-            )
-            metrics_payload = evaluate_experiment_dir(
-                experiment_dir=experiment_dir,
-                metrics=VALIDATION_METRICS,
-                fid_reference_dir=validation_reference_dir,
-                device=device,
-            )
-            write_metrics_json(experiment_dir, metrics_payload)
+            config_fingerprint = make_config_fingerprint(config_base)
+            config = dict(config_base)
+            config['config_fingerprint'] = config_fingerprint
+            config_id = f'{hook_point}_a{alpha}_{config_fingerprint[:10]}'
+            experiment_name = f"{build_experiment_tag('validation', variant, hook_point, alpha)}__{config_fingerprint[:10]}"
+            experiment_dir = os.path.join(output_root, experiment_name)
+
+            metrics_payload = load_cached_validation_metrics(experiment_dir, config_base)
+            if metrics_payload is None:
+                generate_images_for_manifest(
+                    pipe=pipe,
+                    manifest=validation_manifest,
+                    experiment_dir=experiment_dir,
+                    hook_point=hook_point,
+                    alpha=alpha,
+                    num_denoising_steps=num_denoising_steps,
+                    strategy=strategy,
+                    concept_bank=concept_bank,
+                    device=device,
+                    save_config=config,
+                )
+                metrics_payload = evaluate_experiment_dir(
+                    experiment_dir=experiment_dir,
+                    metrics=VALIDATION_METRICS,
+                    fid_reference_dir=validation_reference_dir,
+                    device=device,
+                )
+                write_metrics_json(experiment_dir, metrics_payload)
+            else:
+                print(f'Using cached validation metrics for {hook_point} alpha={alpha} from {experiment_dir}')
+
             row = flatten_metrics_for_summary(
                 metrics_payload=metrics_payload,
                 split='validation',
@@ -1140,6 +1219,11 @@ def run_validation_sweep(
     write_summary_csv(annotated_rows, os.path.join(output_root, 'summary.csv'))
     save_json(os.path.join(output_root, 'summary.json'), annotated_rows)
     save_json(os.path.join(output_root, 'best_config.json'), best_row)
+    save_validation_plot(
+        annotated_rows,
+        os.path.join(output_root, 'validation_alpha_clip_fid.png'),
+        title=os.path.basename(output_root) or 'Validation Sweep',
+    )
     return annotated_rows, best_row
 
 
