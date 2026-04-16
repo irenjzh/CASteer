@@ -10,7 +10,7 @@ import shutil
 import urllib.request
 import zipfile
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 from PIL import Image
@@ -213,6 +213,24 @@ def build_prompts(
     raise ValueError(f'Unsupported prompt mode: {mode}')
 
 
+def _safe_progress_name(value: str) -> str:
+    safe = re.sub(r'[^A-Za-z0-9._-]+', '_', value).strip('._')
+    return safe or 'item'
+
+
+def _save_partial_steering_vectors(
+    save_path: Optional[str],
+    pos_vectors: Sequence[Dict[int, Dict[str, List[np.ndarray]]]],
+    neg_vectors: Sequence[Dict[int, Dict[str, List[np.ndarray]]]],
+    num_denoising_steps: int,
+) -> Optional[Dict[int, Dict[str, List[np.ndarray]]]]:
+    if not save_path or not pos_vectors or not neg_vectors or len(pos_vectors) != len(neg_vectors):
+        return None
+    steering_vectors = compute_steering_vectors(pos_vectors, neg_vectors, num_denoising_steps)
+    save_pickle(save_path, steering_vectors)
+    return steering_vectors
+
+
 def collect_activations(
     pipe,
     prompts_pos: Sequence[str],
@@ -220,12 +238,52 @@ def collect_activations(
     num_denoising_steps: int,
     hook_point: str,
     device: str,
+    checkpoint_path: Optional[str] = None,
+    checkpoint_metadata: Optional[Dict[str, Any]] = None,
+    progress_callback: Optional[Callable[..., None]] = None,
 ):
+    if len(prompts_pos) != len(prompts_neg):
+        raise ValueError('prompts_pos and prompts_neg must have the same length')
+
+    prompts_pos = list(prompts_pos)
+    prompts_neg = list(prompts_neg)
     pos_vectors = []
     neg_vectors = []
     seed = 0
+    checkpoint_payload = {
+        'metadata': {
+            **(checkpoint_metadata or {}),
+            'prompts_pos': prompts_pos,
+            'prompts_neg': prompts_neg,
+            'num_denoising_steps': num_denoising_steps,
+            'hook_point': hook_point,
+        },
+        'completed_prompts': 0,
+        'pos_vectors': [],
+        'neg_vectors': [],
+    }
 
-    for i, (prompt_pos, prompt_neg) in enumerate(zip(prompts_pos, prompts_neg)):
+    if checkpoint_path and os.path.exists(checkpoint_path):
+        saved_checkpoint = load_pickle(checkpoint_path)
+        if saved_checkpoint.get('metadata') == checkpoint_payload['metadata']:
+            pos_vectors = saved_checkpoint.get('pos_vectors', [])
+            neg_vectors = saved_checkpoint.get('neg_vectors', [])
+            if len(pos_vectors) != len(neg_vectors):
+                raise ValueError(f'Checkpoint at {checkpoint_path} is corrupted: prompt counts do not match')
+            if len(pos_vectors) > len(prompts_pos):
+                raise ValueError(f'Checkpoint at {checkpoint_path} has more prompts than the current run')
+            checkpoint_payload = saved_checkpoint
+            if pos_vectors:
+                print(
+                    f'  Resuming activation collection from prompt {len(pos_vectors) + 1}/{len(prompts_pos)} '
+                    f'using checkpoint {checkpoint_path}'
+                )
+        else:
+            print(f'  Ignoring incompatible activation checkpoint at {checkpoint_path}')
+
+    for i in range(len(pos_vectors), len(prompts_pos)):
+        prompt_pos = prompts_pos[i]
+        prompt_neg = prompts_neg[i]
         print(f'  Prompt {i + 1}/{len(prompts_pos)}: pos="{prompt_pos}", neg="{prompt_neg}"')
 
         controller = SanaVectorStore(device=device)
@@ -247,6 +305,15 @@ def collect_activations(
             generator=torch.Generator(device=device).manual_seed(seed),
         )
         neg_vectors.append(controller.vector_store)
+
+        if progress_callback is not None:
+            progress_callback(i, prompt_pos, prompt_neg, pos_vectors, neg_vectors)
+
+        if checkpoint_path:
+            checkpoint_payload['completed_prompts'] = len(pos_vectors)
+            checkpoint_payload['pos_vectors'] = pos_vectors
+            checkpoint_payload['neg_vectors'] = neg_vectors
+            save_pickle(checkpoint_path, checkpoint_payload)
 
     return pos_vectors, neg_vectors
 
@@ -286,10 +353,37 @@ def compute_multi_concept_bank(
     num_concepts: int,
     num_denoising_steps: int,
     device: str,
+    aggregate_save_path: Optional[str] = None,
+    activation_checkpoint_path: Optional[str] = None,
+    partial_bank_path: Optional[str] = None,
 ) -> Dict[str, Dict[int, Dict[str, List[np.ndarray]]]]:
     imagenet_classes = get_imagenet_classes(num_concepts)
     prompts_pos = [f'a photo of {cls}' for cls in imagenet_classes[:num_concepts]]
     prompts_neg = ['a photo'] * len(prompts_pos)
+    partial_bank = load_pickle(partial_bank_path) if partial_bank_path and os.path.exists(partial_bank_path) else {}
+
+    def on_prompt_complete(
+        _prompt_index: int,
+        _prompt_pos: str,
+        _prompt_neg: str,
+        pos_vectors: Sequence[Dict[int, Dict[str, List[np.ndarray]]]],
+        neg_vectors: Sequence[Dict[int, Dict[str, List[np.ndarray]]]],
+    ) -> None:
+        _save_partial_steering_vectors(
+            aggregate_save_path,
+            pos_vectors,
+            neg_vectors,
+            num_denoising_steps,
+        )
+        if partial_bank_path:
+            concept_name = imagenet_classes[len(pos_vectors) - 1]
+            partial_bank[concept_name] = compute_steering_vectors(
+                [pos_vectors[-1]],
+                [neg_vectors[-1]],
+                num_denoising_steps=num_denoising_steps,
+            )
+            save_pickle(partial_bank_path, partial_bank)
+
     pos_vectors, neg_vectors = collect_activations(
         pipe=pipe,
         prompts_pos=prompts_pos,
@@ -297,6 +391,13 @@ def compute_multi_concept_bank(
         num_denoising_steps=num_denoising_steps,
         hook_point=hook_point,
         device=device,
+        checkpoint_path=activation_checkpoint_path,
+        checkpoint_metadata={
+            'bank_mode': 'multi_concept',
+            'hook_point': hook_point,
+            'num_concepts': num_concepts,
+        },
+        progress_callback=on_prompt_complete,
     )
 
     concept_bank: Dict[str, Dict[int, Dict[str, List[np.ndarray]]]] = {}
@@ -317,17 +418,21 @@ def load_or_compute_multi_concept_bank(
     device: Optional[str] = None,
 ) -> Tuple[Dict[str, Dict[int, Dict[str, List[np.ndarray]]]], str]:
     device = device or get_device()
+    ensure_dir(bank_dir)
     bank_path = os.path.join(bank_dir, f'sana_{hook_point}_{num_concepts}concepts_bank.pickle')
     if os.path.exists(bank_path):
         return load_pickle(bank_path), bank_path
 
-    ensure_dir(bank_dir)
+    progress_dir = ensure_dir(os.path.join(bank_dir, f'{Path(bank_path).stem}_progress'))
     concept_bank = compute_multi_concept_bank(
         pipe=pipe,
         hook_point=hook_point,
         num_concepts=num_concepts,
         num_denoising_steps=num_denoising_steps,
         device=device,
+        aggregate_save_path=os.path.join(progress_dir, f'sana_{hook_point}_{num_concepts}concepts.partial.pickle'),
+        activation_checkpoint_path=os.path.join(progress_dir, 'activations.checkpoint.pickle'),
+        partial_bank_path=os.path.join(progress_dir, 'concept_bank_partial.pickle'),
     )
     save_pickle(bank_path, concept_bank)
     return concept_bank, bank_path
@@ -342,15 +447,75 @@ def load_or_compute_per_concept_bank(
     device: Optional[str] = None,
 ) -> Tuple[Dict[str, Dict[int, Dict[str, List[np.ndarray]]]], str]:
     device = device or get_device()
+    ensure_dir(bank_dir)
     bank_path = os.path.join(bank_dir, f'sana_{hook_point}_per_concept_bank.pickle')
     if os.path.exists(bank_path):
         return load_pickle(bank_path), bank_path
 
     concepts = list(concepts or DEFAULT_BANK_CONCEPTS)
+    progress_dir = ensure_dir(os.path.join(bank_dir, f'{Path(bank_path).stem}_progress'))
+    bank_progress_path = os.path.join(progress_dir, 'concept_bank_partial.pickle')
+    progress_state_path = os.path.join(progress_dir, 'progress_state.json')
+    progress_signature = {
+        'hook_point': hook_point,
+        'num_denoising_steps': num_denoising_steps,
+        'concepts': [{'concept': concept, 'mode': mode} for concept, mode in concepts],
+    }
+
     concept_bank = {}
+    if os.path.exists(bank_progress_path) and os.path.exists(progress_state_path):
+        saved_state = load_json(progress_state_path)
+        if saved_state.get('signature') == progress_signature:
+            concept_bank = load_pickle(bank_progress_path)
+            progress_state = saved_state
+        else:
+            progress_state = {'signature': progress_signature, 'concepts': {}}
+    else:
+        progress_state = {'signature': progress_signature, 'concepts': {}}
+
     for idx, (concept, mode) in enumerate(concepts):
+        concept_state = progress_state['concepts'].get(concept, {})
+        if concept in concept_bank and concept_state.get('status') == 'complete':
+            print(f'\n=== [{idx + 1}/{len(concepts)}] Concept: "{concept}" (mode={mode}) already completed, skipping ===')
+            continue
+
         print(f'\n=== [{idx + 1}/{len(concepts)}] Concept: "{concept}" (mode={mode}) ===')
         prompts_pos, prompts_neg = build_prompts(mode, concept)
+        concept_checkpoint_path = os.path.join(
+            progress_dir,
+            f'{idx:02d}_{_safe_progress_name(concept)}.checkpoint.pickle',
+        )
+        concept_partial_path = os.path.join(
+            progress_dir,
+            f'{idx:02d}_{_safe_progress_name(concept)}.partial_sv.pickle',
+        )
+
+        def on_prompt_complete(
+            _prompt_index: int,
+            _prompt_pos: str,
+            _prompt_neg: str,
+            pos_vectors: Sequence[Dict[int, Dict[str, List[np.ndarray]]]],
+            neg_vectors: Sequence[Dict[int, Dict[str, List[np.ndarray]]]],
+        ) -> None:
+            partial_vectors = _save_partial_steering_vectors(
+                concept_partial_path,
+                pos_vectors,
+                neg_vectors,
+                num_denoising_steps,
+            )
+            if partial_vectors is not None:
+                concept_bank[concept] = partial_vectors
+                save_pickle(bank_progress_path, concept_bank)
+            progress_state['concepts'][concept] = {
+                'mode': mode,
+                'status': 'partial',
+                'completed_prompts': len(pos_vectors),
+                'num_prompts': len(prompts_pos),
+                'checkpoint_path': concept_checkpoint_path,
+                'partial_sv_path': concept_partial_path,
+            }
+            save_json(progress_state_path, progress_state)
+
         pos_vecs, neg_vecs = collect_activations(
             pipe=pipe,
             prompts_pos=prompts_pos,
@@ -358,8 +523,25 @@ def load_or_compute_per_concept_bank(
             num_denoising_steps=num_denoising_steps,
             hook_point=hook_point,
             device=device,
+            checkpoint_path=concept_checkpoint_path,
+            checkpoint_metadata={
+                'concept': concept,
+                'mode': mode,
+                'bank_path': bank_path,
+            },
+            progress_callback=on_prompt_complete,
         )
         concept_bank[concept] = compute_steering_vectors(pos_vecs, neg_vecs, num_denoising_steps)
+        save_pickle(bank_progress_path, concept_bank)
+        progress_state['concepts'][concept] = {
+            'mode': mode,
+            'status': 'complete',
+            'completed_prompts': len(prompts_pos),
+            'num_prompts': len(prompts_pos),
+            'checkpoint_path': concept_checkpoint_path,
+            'partial_sv_path': concept_partial_path,
+        }
+        save_json(progress_state_path, progress_state)
 
     save_pickle(bank_path, concept_bank)
     return concept_bank, bank_path
@@ -392,8 +574,38 @@ def load_or_compute_concept_bank(
             num_denoising_steps=num_denoising_steps,
             bank_dir=bank_dir,
             device=device,
-        )
+    )
     raise ValueError(f'Unsupported bank_mode={bank_mode!r}')
+
+
+def load_or_compute_hook_point_banks(
+    pipe,
+    hook_points: Sequence[str] = tuple(DEFAULT_HOOK_POINTS),
+    bank_mode: str = DEFAULT_SANA_BANK_MODE,
+    num_concepts: int = 50,
+    num_denoising_steps: int = 20,
+    bank_dir: str = 'steering_vectors_sana',
+    concepts: Optional[Sequence[Tuple[str, str]]] = None,
+    device: Optional[str] = None,
+) -> Dict[str, Dict[str, Any]]:
+    device = device or get_device()
+    prepared_banks: Dict[str, Dict[str, Any]] = {}
+    for hook_point in hook_points:
+        concept_bank, bank_path = load_or_compute_concept_bank(
+            pipe=pipe,
+            hook_point=hook_point,
+            bank_mode=bank_mode,
+            num_concepts=num_concepts,
+            num_denoising_steps=num_denoising_steps,
+            bank_dir=bank_dir,
+            concepts=concepts,
+            device=device,
+        )
+        prepared_banks[hook_point] = {
+            'concept_bank': concept_bank,
+            'bank_path': bank_path,
+        }
+    return prepared_banks
 
 
 def get_active_layers(strategy: str, num_layers: int, seed: int = 0):
@@ -1241,22 +1453,28 @@ def run_validation_sweep(
     alphas: Sequence[float] = tuple(ALPHAS_P1),
     bank_mode: str = DEFAULT_SANA_BANK_MODE,
     bank_dir: str = 'steering_vectors_sana',
+    prepared_banks: Optional[Dict[str, Dict[str, Any]]] = None,
     device: Optional[str] = None,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     device = device or get_device()
     sweep_rows = []
     ensure_dir(output_root)
 
+    prepared_banks = prepared_banks or load_or_compute_hook_point_banks(
+        pipe=pipe,
+        hook_points=hook_points,
+        bank_mode=bank_mode,
+        num_concepts=num_concepts,
+        num_denoising_steps=num_denoising_steps,
+        bank_dir=bank_dir,
+        device=device,
+    )
+
     for hook_point in hook_points:
-        concept_bank, bank_path = load_or_compute_concept_bank(        
-            pipe=pipe,
-            hook_point=hook_point,
-            bank_mode=bank_mode,
-            num_concepts=num_concepts,
-            num_denoising_steps=num_denoising_steps,
-            bank_dir=bank_dir,
-            device=device, 
-        )
+        if hook_point not in prepared_banks:
+            raise ValueError(f'Missing prepared bank for hook_point={hook_point!r}')
+        concept_bank = prepared_banks[hook_point]['concept_bank']
+        bank_path = prepared_banks[hook_point]['bank_path']
         for alpha in alphas:
             variant = 'best_steering'
             config_base = {

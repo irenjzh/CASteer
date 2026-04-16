@@ -9,6 +9,7 @@ from sana_experiment_utils import (
     compute_steering_vectors,
     get_device,
     get_imagenet_classes,
+    load_pickle,
     load_or_compute_per_concept_bank,
     load_sana_pipeline,
     save_pickle,
@@ -88,6 +89,41 @@ def main():
             args.concept_neg,
         )
 
+    if args.averaging == 'per_concept':
+        save_path = os.path.join(args.save_dir, f'sana_{args.hook_point}_{args.concept_pos}_{args.concept_neg}.pickle')
+    else:
+        save_path = os.path.join(args.save_dir, f'sana_{args.hook_point}_{args.num_concepts}concepts.pickle')
+
+    checkpoint_path = f'{save_path}.checkpoint.pickle'
+    multi_concept_partial_bank = {}
+    multi_concept_partial_bank_path = None
+    if args.averaging == 'multi_concept':
+        multi_concept_partial_bank_path = os.path.join(
+            args.save_dir,
+            f'sana_{args.hook_point}_{args.num_concepts}concepts_bank.partial.pickle',
+        )
+        if os.path.exists(multi_concept_partial_bank_path):
+            multi_concept_partial_bank = load_pickle(multi_concept_partial_bank_path)
+
+    def on_prompt_complete(
+        _prompt_index,
+        _prompt_pos,
+        _prompt_neg,
+        pos_vectors,
+        neg_vectors,
+    ):
+        partial_vectors = compute_steering_vectors(pos_vectors, neg_vectors, args.num_denoising_steps)
+        save_pickle(save_path, partial_vectors)
+
+        if args.averaging == 'multi_concept':
+            concept_name = imagenet_classes[len(pos_vectors) - 1]
+            multi_concept_partial_bank[concept_name] = compute_steering_vectors(
+                [pos_vectors[-1]],
+                [neg_vectors[-1]],
+                args.num_denoising_steps,
+            )
+            save_pickle(multi_concept_partial_bank_path, multi_concept_partial_bank)
+
     pos_vectors, neg_vectors = collect_activations(
         pipe=pipe,
         prompts_pos=prompts_pos,
@@ -95,16 +131,24 @@ def main():
         num_denoising_steps=args.num_denoising_steps,
         hook_point=args.hook_point,
         device=device,
+        checkpoint_path=checkpoint_path,
+        checkpoint_metadata={
+            'averaging': args.averaging,
+            'concept_pos': args.concept_pos,
+            'concept_neg': args.concept_neg,
+            'prompt_mode': args.prompt_mode,
+            'num_concepts': args.num_concepts,
+            'save_path': save_path,
+        },
+        progress_callback=on_prompt_complete,
     )
     steering_vectors = compute_steering_vectors(pos_vectors, neg_vectors, args.num_denoising_steps)
 
     if args.averaging == 'per_concept':
-        save_path = os.path.join(args.save_dir, f'sana_{args.hook_point}_{args.concept_pos}_{args.concept_neg}.pickle')
         save_pickle(save_path, steering_vectors)
         print(f'Saved per-concept averaged steering vectors to {save_path}')
         return
 
-    save_path = os.path.join(args.save_dir, f'sana_{args.hook_point}_{args.num_concepts}concepts.pickle')
     save_pickle(save_path, steering_vectors)
     print(f'Saved steering vectors to {save_path}')
 
