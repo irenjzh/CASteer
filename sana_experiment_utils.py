@@ -1188,11 +1188,25 @@ def find_experiment_dirs(root_dir: str) -> List[str]:
             dirnames[:] = [d for d in dirnames if not d.startswith('prompt_')]
     return sorted(experiment_dirs)
 
+
+def _row_metric_value(row: Dict[str, Any], metric_name: str) -> float:
+    value = row.get(metric_name)
+    if value is None:
+        value = row.get(f'{metric_name}_mean')
+    if value is None:
+        raise KeyError(metric_name)
+    return float(value)
+
+
 def _dominates(row_a: Dict[str, Any], row_b: Dict[str, Any]) -> bool:
+    clip_a = _row_metric_value(row_a, 'clip_score_mean')
+    clip_b = _row_metric_value(row_b, 'clip_score_mean')
+    fid_a = _row_metric_value(row_a, 'fid')
+    fid_b = _row_metric_value(row_b, 'fid')
     return (
-        row_a['clip_score_mean'] >= row_b['clip_score_mean']
-        and row_a['fid'] <= row_b['fid']
-        and (row_a['clip_score_mean'] > row_b['clip_score_mean'] or row_a['fid'] < row_b['fid'])
+        clip_a >= clip_b
+        and fid_a <= fid_b
+        and (clip_a > clip_b or fid_a < fid_b)
     )
 
 
@@ -1215,13 +1229,15 @@ def assign_pareto_ranks(rows: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
 def add_selection_scores(rows: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
     rows = [dict(row) for row in rows]
-    clips = np.asarray([row['clip_score_mean'] for row in rows], dtype=np.float32)
-    fids = np.asarray([row['fid'] for row in rows], dtype=np.float32)
+    clips = np.asarray([_row_metric_value(row, 'clip_score_mean') for row in rows], dtype=np.float32)
+    fids = np.asarray([_row_metric_value(row, 'fid') for row in rows], dtype=np.float32)
     clip_min, clip_max = float(clips.min()), float(clips.max())
     fid_min, fid_max = float(fids.min()), float(fids.max())
     for row in rows:
-        clip_norm = (row['clip_score_mean'] - clip_min) / max(clip_max - clip_min, 1e-8)
-        fid_norm = (row['fid'] - fid_min) / max(fid_max - fid_min, 1e-8)
+        clip_value = _row_metric_value(row, 'clip_score_mean')
+        fid_value = _row_metric_value(row, 'fid')
+        clip_norm = (clip_value - clip_min) / max(clip_max - clip_min, 1e-8)
+        fid_norm = (fid_value - fid_min) / max(fid_max - fid_min, 1e-8)
         row['selection_score'] = float(clip_norm + (1.0 - fid_norm))
         row['is_selected_best'] = False
     return rows
@@ -1231,7 +1247,14 @@ def select_best_validation_row(rows: Sequence[Dict[str, Any]]) -> Tuple[Dict[str
     ranked = assign_pareto_ranks(rows)
     scored = add_selection_scores(ranked)
     pareto_rows = [row for row in scored if row['pareto_rank'] == 1]
-    best = max(pareto_rows, key=lambda row: (row['selection_score'], row['clip_score_mean'], -row['fid']))
+    best = max(
+        pareto_rows,
+        key=lambda row: (
+            row['selection_score'],
+            _row_metric_value(row, 'clip_score_mean'),
+            -_row_metric_value(row, 'fid'),
+        ),
+    )
     for row in scored:
         if row['config_id'] == best['config_id']:
             row['is_selected_best'] = True
@@ -1287,6 +1310,7 @@ def flatten_metrics_for_summary(
     for metric_name in ['clip_score_mean', 'mps', 'vendi_score', 'pick_score_mean', 'image_reward_mean']:
         metric_value = aggregate.get(metric_name)
         if isinstance(metric_value, dict):
+            row[metric_name] = metric_value['mean']
             row[f'{metric_name}_mean'] = metric_value['mean']
             row[f'{metric_name}_std'] = metric_value['std']
         elif metric_value is not None:
@@ -1386,8 +1410,8 @@ def save_validation_plot(rows: Sequence[Dict[str, Any]], output_path: str, title
     for hook_point, hook_rows in sorted(grouped.items()):
         hook_rows = sorted(hook_rows, key=lambda item: float(item['alpha']))
         alphas = [float(item['alpha']) for item in hook_rows]
-        clips = [float(item['clip_score_mean_mean']) for item in hook_rows]
-        fids = [float(item['fid']) for item in hook_rows]
+        clips = [_row_metric_value(item, 'clip_score_mean') for item in hook_rows]
+        fids = [_row_metric_value(item, 'fid') for item in hook_rows]
         axes[0].plot(alphas, clips, marker='o', label=hook_point)
         axes[1].plot(alphas, fids, marker='o', label=hook_point)
 
