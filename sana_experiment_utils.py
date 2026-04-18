@@ -1069,7 +1069,10 @@ def _load_pickscore(device: str):
         return _PICKSCORE_PROCESSOR, _PICKSCORE_MODEL
     from transformers import AutoModel, AutoProcessor
 
-    _PICKSCORE_PROCESSOR = AutoProcessor.from_pretrained('laion/CLIP-ViT-H-14-laion2B-s32B-b79K')
+    _PICKSCORE_PROCESSOR = AutoProcessor.from_pretrained(
+        'laion/CLIP-ViT-H-14-laion2B-s32B-b79K',
+        use_fast=False,
+    )
     _PICKSCORE_MODEL = AutoModel.from_pretrained('yuvalkirstain/PickScore_v1').eval().to(device)
     return _PICKSCORE_PROCESSOR, _PICKSCORE_MODEL
 
