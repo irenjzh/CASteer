@@ -37,9 +37,10 @@ DEFAULT_HOOK_POINTS = ['cross_attn', 'self_attn', 'residual']
 ALPHAS_P1 = [0.1, 0.7, 1.4]
 ALPHAS_P2_MASTER = [0.05, 0.1, 0.2, 0.3, 0.5, 0.8, 1.1, 1.4]
 VALIDATION_METRICS = ['clip_score', 'fid']
-TEST_METRICS = ['clip_score', 'pick_score', 'image_reward', 'mps', 'vendi']
+TEST_METRICS = ['clip_score', 'pick_score', 'mps', 'vendi']
 DEFAULT_VALIDATION_SIZE = 100
 DEFAULT_TEST_SIZE = 2000
+EVALUATION_ONLY_CONFIG_KEYS = {'evaluation_prompt_limit'}
 
 DEFAULT_SANA_BANK_MODE = 'per_concept_bank'
 
@@ -868,6 +869,38 @@ def _is_prompt_complete(experiment_dir: str, prompt_index: int, seeds: Sequence[
     return all(os.path.exists(_prompt_image_path(experiment_dir, prompt_index, seed)) for seed in seeds)
 
 
+def _complete_prompt_prefix_length(experiment_dir: str, manifest: Sequence[Dict[str, Any]]) -> int:
+    prefix_length = 0
+    for record in manifest:
+        if not _is_prompt_complete(experiment_dir, record['prompt_index'], record['seeds']):
+            break
+        prefix_length += 1
+    return prefix_length
+
+
+def _resolve_shared_prompt_limit(
+    manifest: Sequence[Dict[str, Any]],
+    experiment_dirs: Sequence[str],
+    default_limit: int,
+) -> int:
+    target_limit = min(default_limit, len(manifest))
+    if target_limit <= 0:
+        return 0
+
+    manifest_prefix = list(manifest)[:target_limit]
+    existing_limits = []
+    for experiment_dir in experiment_dirs:
+        if not os.path.exists(experiment_dir):
+            continue
+        complete_prefix = _complete_prompt_prefix_length(experiment_dir, manifest_prefix)
+        if complete_prefix > 0:
+            existing_limits.append(complete_prefix)
+
+    if existing_limits:
+        return min([target_limit] + existing_limits)
+    return target_limit
+
+
 def _save_prompt_metadata(
     prompt_dir: str,
     record: Dict[str, Any],
@@ -1444,8 +1477,16 @@ def write_summary_csv(rows: Sequence[Dict[str, Any]], output_path: str) -> str:
     return output_path
 
 
+def _config_for_fingerprint(config: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        key: value
+        for key, value in config.items()
+        if key not in EVALUATION_ONLY_CONFIG_KEYS and key != 'config_fingerprint'
+    }
+
+
 def make_config_fingerprint(config: Dict[str, Any]) -> str:
-    payload = json.dumps(config, sort_keys=True, ensure_ascii=False, default=str)
+    payload = json.dumps(_config_for_fingerprint(config), sort_keys=True, ensure_ascii=False, default=str)
     return hashlib.sha1(payload.encode('utf-8')).hexdigest()
 
 
@@ -1454,7 +1495,11 @@ def _validation_metrics_are_complete(metrics_payload: Dict[str, Any]) -> bool:
     return 'clip_score_mean' in aggregate and 'fid' in aggregate
 
 
-def load_cached_validation_metrics(experiment_dir: str, config: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+def load_cached_validation_metrics(
+    experiment_dir: str,
+    config: Dict[str, Any],
+    prompt_limit: Optional[int] = None,
+) -> Optional[Dict[str, Any]]:
     config_path = os.path.join(experiment_dir, 'config.json')
     metrics_path = os.path.join(experiment_dir, 'metrics.json')
     if not (os.path.exists(config_path) and os.path.exists(metrics_path)):
@@ -1462,14 +1507,14 @@ def load_cached_validation_metrics(experiment_dir: str, config: Dict[str, Any]) 
 
     stored_config = load_json(config_path)
     expected_fp = make_config_fingerprint(config)
-    stored_fp = stored_config.get('config_fingerprint') or make_config_fingerprint(
-        {k: v for k, v in stored_config.items() if k != 'config_fingerprint'}
-    )
+    stored_fp = make_config_fingerprint(stored_config)
     if stored_fp != expected_fp:
         return None
 
     metrics_payload = load_json(metrics_path)
     if not _validation_metrics_are_complete(metrics_payload):
+        return None
+    if prompt_limit is not None and metrics_payload.get('aggregate', {}).get('prompt_limit') != prompt_limit:
         return None
     return metrics_payload
 
@@ -1478,9 +1523,7 @@ def _stored_config_fingerprint(config_path: str) -> Optional[str]:
     if not os.path.exists(config_path):
         return None
     stored_config = load_json(config_path)
-    return stored_config.get('config_fingerprint') or make_config_fingerprint(
-        {k: v for k, v in stored_config.items() if k != 'config_fingerprint'}
-    )
+    return make_config_fingerprint(stored_config)
 
 
 def resolve_validation_experiment_dir(
@@ -1607,6 +1650,7 @@ def run_validation_sweep(
         device=device,
     )
 
+    experiment_specs = []
     for hook_point in hook_points:
         if hook_point not in prepared_banks:
             raise ValueError(f'Missing prepared bank for hook_point={hook_point!r}')
@@ -1614,7 +1658,6 @@ def run_validation_sweep(
         bank_path = prepared_banks[hook_point]['bank_path']
         for alpha in alphas:
             variant = 'best_steering'
-            prompt_limit = len(validation_manifest)
             config_base = {
                 'split': 'validation',
                 'variant': variant,
@@ -1627,7 +1670,6 @@ def run_validation_sweep(
                 'num_concepts': num_concepts,
                 'bank_mode': bank_mode,
                 'steering_bank_path': bank_path,
-                'evaluation_prompt_limit': prompt_limit,
                 'metrics': VALIDATION_METRICS,
             }
             experiment_dir, config_fingerprint = resolve_validation_experiment_dir(
@@ -1637,47 +1679,81 @@ def run_validation_sweep(
                 alpha=alpha,
                 config_base=config_base,
             )
-            config = dict(config_base)
-            config['config_fingerprint'] = config_fingerprint
-            config_id = f'{hook_point}_a{alpha}_{config_fingerprint[:10]}'
+            experiment_specs.append(
+                {
+                    'hook_point': hook_point,
+                    'alpha': alpha,
+                    'concept_bank': concept_bank,
+                    'bank_path': bank_path,
+                    'config_base': config_base,
+                    'config_fingerprint': config_fingerprint,
+                    'config_id': f'{hook_point}_a{alpha}_{config_fingerprint[:10]}',
+                    'experiment_dir': experiment_dir,
+                }
+            )
 
-            metrics_payload = load_cached_validation_metrics(experiment_dir, config_base)
-            if metrics_payload is None:
+    prompt_limit = _resolve_shared_prompt_limit(
+        validation_manifest,
+        [spec['experiment_dir'] for spec in experiment_specs],
+        DEFAULT_VALIDATION_SIZE,
+    )
+    active_manifest = list(validation_manifest)[:prompt_limit]
+
+    for spec in experiment_specs:
+        config = dict(spec['config_base'])
+        config['evaluation_prompt_limit'] = prompt_limit
+        config['config_fingerprint'] = spec['config_fingerprint']
+        if os.path.exists(spec['experiment_dir']):
+            write_experiment_config(spec['experiment_dir'], config)
+
+        metrics_payload = load_cached_validation_metrics(
+            spec['experiment_dir'],
+            spec['config_base'],
+            prompt_limit=prompt_limit,
+        )
+        if metrics_payload is None:
+            existing_prefix = _complete_prompt_prefix_length(spec['experiment_dir'], active_manifest)
+            if existing_prefix < prompt_limit:
                 generate_images_for_manifest(
                     pipe=pipe,
-                    manifest=validation_manifest,
-                    experiment_dir=experiment_dir,
-                    hook_point=hook_point,
-                    alpha=alpha,
+                    manifest=active_manifest,
+                    experiment_dir=spec['experiment_dir'],
+                    hook_point=spec['hook_point'],
+                    alpha=spec['alpha'],
                     num_denoising_steps=num_denoising_steps,
                     strategy=strategy,
-                    concept_bank=concept_bank,
+                    concept_bank=spec['concept_bank'],
                     device=device,
                     save_config=config,
                 )
-                metrics_payload = evaluate_experiment_dir(
-                    experiment_dir=experiment_dir,
-                    metrics=VALIDATION_METRICS,
-                    fid_reference_dir=validation_reference_dir,
-                    device=device,
-                    prompt_limit=prompt_limit,
-                )
-                write_metrics_json(experiment_dir, metrics_payload)
-            else:
-                print(f'Using cached validation metrics for {hook_point} alpha={alpha} from {experiment_dir}')
-
-            row = flatten_metrics_for_summary(
-                metrics_payload=metrics_payload,
-                split='validation',
-                variant=variant,
-                model_alias=model_alias,
-                hook_point=hook_point,
-                alpha=alpha,
+            elif os.path.exists(spec['experiment_dir']):
+                write_experiment_config(spec['experiment_dir'], config)
+            metrics_payload = evaluate_experiment_dir(
+                experiment_dir=spec['experiment_dir'],
+                metrics=VALIDATION_METRICS,
+                fid_reference_dir=validation_reference_dir,
+                device=device,
+                prompt_limit=prompt_limit,
             )
-            row['config_id'] = config_id
-            row['experiment_dir'] = experiment_dir
-            row['steering_bank_path'] = bank_path
-            sweep_rows.append(row)
+            write_metrics_json(spec['experiment_dir'], metrics_payload)
+        else:
+            print(
+                f'Using cached validation metrics for {spec["hook_point"]} '
+                f'alpha={spec["alpha"]} from {spec["experiment_dir"]}'
+            )
+
+        row = flatten_metrics_for_summary(
+            metrics_payload=metrics_payload,
+            split='validation',
+            variant=spec['config_base']['variant'],
+            model_alias=model_alias,
+            hook_point=spec['hook_point'],
+            alpha=spec['alpha'],
+        )
+        row['config_id'] = spec['config_id']
+        row['experiment_dir'] = spec['experiment_dir']
+        row['steering_bank_path'] = spec['bank_path']
+        sweep_rows.append(row)
 
     best_row, annotated_rows = select_best_validation_row(sweep_rows)
     write_summary_csv(annotated_rows, os.path.join(output_root, 'summary.csv'))
@@ -1750,13 +1826,13 @@ def run_test_evaluation(
     ]
 
     summary_rows = []
-    prompt_limit = len(test_manifest)
+    variant_specs = []
     for variant in variants:
         experiment_dir = os.path.join(
             output_root,
             build_experiment_tag('test', variant['variant'], variant['hook_point'], variant['alpha']),
         )
-        config = {
+        config_base = {
             'split': 'test',
             'variant': variant['variant'],
             'model_alias': model_alias,
@@ -1769,30 +1845,56 @@ def run_test_evaluation(
             'bank_mode': bank_mode,
             'steering_bank_path': bank_path if variant['variant'] == 'best_steering' else None,
             'random_sv_path': random_sv_path if variant['variant'] == 'random_steering' else None,
-            'evaluation_prompt_limit': prompt_limit,
             'metrics': TEST_METRICS,
         }
-        generate_images_for_manifest(
-            pipe=pipe,
-            manifest=test_manifest,
-            experiment_dir=experiment_dir,
-            hook_point=variant['hook_point'],
-            alpha=variant['alpha'],
-            num_denoising_steps=num_denoising_steps,
-            strategy=strategy,
-            concept_bank=variant['concept_bank'],
-            steering_vectors=variant['steering_vectors'],
-            baseline=variant['baseline'],
-            device=device,
-            save_config=config,
+        variant_specs.append(
+            {
+                'variant': variant,
+                'experiment_dir': experiment_dir,
+                'config_base': config_base,
+            }
         )
+
+    prompt_limit = _resolve_shared_prompt_limit(
+        test_manifest,
+        [spec['experiment_dir'] for spec in variant_specs],
+        DEFAULT_TEST_SIZE,
+    )
+    active_manifest = list(test_manifest)[:prompt_limit]
+
+    for spec in variant_specs:
+        variant = spec['variant']
+        config = dict(spec['config_base'])
+        config['evaluation_prompt_limit'] = prompt_limit
+        if os.path.exists(spec['experiment_dir']):
+            write_experiment_config(spec['experiment_dir'], config)
+
+        existing_prefix = _complete_prompt_prefix_length(spec['experiment_dir'], active_manifest)
+        if existing_prefix < prompt_limit:
+            generate_images_for_manifest(
+                pipe=pipe,
+                manifest=active_manifest,
+                experiment_dir=spec['experiment_dir'],
+                hook_point=variant['hook_point'],
+                alpha=variant['alpha'],
+                num_denoising_steps=num_denoising_steps,
+                strategy=strategy,
+                concept_bank=variant['concept_bank'],
+                steering_vectors=variant['steering_vectors'],
+                baseline=variant['baseline'],
+                device=device,
+                save_config=config,
+            )
+        elif os.path.exists(spec['experiment_dir']):
+            write_experiment_config(spec['experiment_dir'], config)
+
         metrics_payload = evaluate_experiment_dir(
-            experiment_dir=experiment_dir,
+            experiment_dir=spec['experiment_dir'],
             metrics=TEST_METRICS,
             device=device,
             prompt_limit=prompt_limit,
         )
-        write_metrics_json(experiment_dir, metrics_payload)
+        write_metrics_json(spec['experiment_dir'], metrics_payload)
         summary_rows.append(
             flatten_metrics_for_summary(
                 metrics_payload=metrics_payload,
