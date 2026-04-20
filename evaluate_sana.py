@@ -1,7 +1,5 @@
 import argparse
-import json
 import os
-from typing import Optional
 
 from sana_experiment_utils import (
     TEST_METRICS,
@@ -24,34 +22,7 @@ def parse_args():
         choices=sorted(set(TEST_METRICS + VALIDATION_METRICS)),
     )
     parser.add_argument('--fid_reference_dir', type=str, default=None, help='Reference image directory for FID')
-    parser.add_argument('--prompt_limit', type=int, default=None, help='Evaluate only prompt_<idx> with idx < limit')
-    parser.add_argument(
-        '--validation_prompt_limit',
-        type=int,
-        default=None,
-        help='Validation-only prompt limit override',
-    )
-    parser.add_argument(
-        '--test_prompt_limit',
-        type=int,
-        default=None,
-        help='Test-only prompt limit override',
-    )
     return parser.parse_args()
-
-
-def resolve_prompt_limit(experiment_dir: str, args) -> Optional[int]:
-    config_path = os.path.join(experiment_dir, 'config.json')
-    split = None
-    if os.path.exists(config_path):
-        with open(config_path, 'r', encoding='utf-8') as f:
-            split = json.load(f).get('split')
-
-    if split == 'validation' and args.validation_prompt_limit is not None:
-        return args.validation_prompt_limit
-    if split == 'test' and args.test_prompt_limit is not None:
-        return args.test_prompt_limit
-    return args.prompt_limit
 
 
 def main():
@@ -72,13 +43,11 @@ def main():
         print(f'\n{"=" * 60}')
         print(f'Evaluating: {rel_path}')
         print(f'{"=" * 60}')
-        prompt_limit = resolve_prompt_limit(experiment_dir, args)
         metrics_payload = evaluate_experiment_dir(
             experiment_dir=experiment_dir,
             metrics=args.metrics,
             fid_reference_dir=args.fid_reference_dir,
             device=device,
-            prompt_limit=prompt_limit,
         )
         write_metrics_json(experiment_dir, metrics_payload)
         for key, value in metrics_payload['aggregate'].items():
