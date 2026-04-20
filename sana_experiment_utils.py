@@ -38,6 +38,8 @@ ALPHAS_P1 = [0.1, 0.7, 1.4]
 ALPHAS_P2_MASTER = [0.05, 0.1, 0.2, 0.3, 0.5, 0.8, 1.1, 1.4]
 VALIDATION_METRICS = ['clip_score', 'fid']
 TEST_METRICS = ['clip_score', 'pick_score', 'image_reward', 'mps', 'vendi']
+DEFAULT_VALIDATION_SIZE = 100
+DEFAULT_TEST_SIZE = 2000
 
 DEFAULT_SANA_BANK_MODE = 'per_concept_bank'
 
@@ -746,8 +748,8 @@ def create_reference_dir(records: Sequence[Dict[str, Any]], reference_dir: str) 
 def create_coco_split_manifests(
     coco_dir: str,
     output_dir: str,
-    validation_size: int = 100,
-    test_size: int = 2000,
+    validation_size: int = DEFAULT_VALIDATION_SIZE,
+    test_size: int = DEFAULT_TEST_SIZE,
     split_seed: int = 42,
     seeds: Optional[Sequence[int]] = None,
     overwrite: bool = False,
@@ -815,8 +817,8 @@ def create_coco_split_manifests(
 def validate_split_manifests(
     validation_manifest: Sequence[Dict[str, Any]],
     test_manifest: Sequence[Dict[str, Any]],
-    validation_size: int = 100,
-    test_size: int = 2000,
+    validation_size: int = DEFAULT_VALIDATION_SIZE,
+    test_size: int = DEFAULT_TEST_SIZE,
     images_per_prompt: int = 5,
 ) -> Dict[str, int]:
     val_ids = [record['image_id'] for record in validation_manifest]
@@ -998,6 +1000,62 @@ def load_prompt_images(prompt_dir: str) -> Tuple[List[Image.Image], List[str]]:
     return images, image_paths
 
 
+def _prompt_dir_index(prompt_dir: str) -> int:
+    match = re.search(r'prompt_(\d+)$', os.path.basename(prompt_dir))
+    if not match:
+        raise ValueError(f'Could not parse prompt index from {prompt_dir}')
+    return int(match.group(1))
+
+
+def _default_prompt_limit_for_split(split: Optional[str]) -> Optional[int]:
+    if split == 'validation':
+        return DEFAULT_VALIDATION_SIZE
+    if split == 'test':
+        return DEFAULT_TEST_SIZE
+    return None
+
+
+def _infer_experiment_split(experiment_dir: str) -> Optional[str]:
+    config_path = os.path.join(experiment_dir, 'config.json')
+    if os.path.exists(config_path):
+        config = load_json(config_path)
+        split = config.get('split')
+        if split in {'validation', 'test'}:
+            return split
+
+    experiment_name = os.path.basename(os.path.normpath(experiment_dir))
+    if experiment_name.startswith('validation_'):
+        return 'validation'
+    if experiment_name.startswith('test_'):
+        return 'test'
+    return None
+
+
+def _resolve_evaluation_prompt_limit(experiment_dir: str, prompt_limit: Optional[int] = None) -> Optional[int]:
+    if prompt_limit is not None:
+        return int(prompt_limit)
+
+    config_path = os.path.join(experiment_dir, 'config.json')
+    if os.path.exists(config_path):
+        config = load_json(config_path)
+        stored_limit = config.get('evaluation_prompt_limit')
+        if stored_limit is not None:
+            return int(stored_limit)
+
+    split = _infer_experiment_split(experiment_dir)
+    return _default_prompt_limit_for_split(split)
+
+
+def _collect_prompt_dirs(experiment_dir: str, prompt_limit: Optional[int] = None) -> List[str]:
+    prompt_dirs = sorted(
+        glob.glob(os.path.join(experiment_dir, 'prompt_*')),
+        key=_prompt_dir_index,
+    )
+    if prompt_limit is None:
+        return prompt_dirs
+    return [prompt_dir for prompt_dir in prompt_dirs if _prompt_dir_index(prompt_dir) < prompt_limit]
+
+
 def _load_clip(device: str):
     global _CLIP_MODEL, _CLIP_PREPROCESS
     if _CLIP_MODEL is not None:
@@ -1103,9 +1161,42 @@ def compute_image_reward(images: Sequence[Image.Image], prompt: str) -> List[flo
     return [reward_model.score(prompt, img) for img in images]
 
 
-def ensure_flat_image_dir(experiment_dir: str) -> str:
-    flat_dir = ensure_dir(os.path.join(experiment_dir, '_fid_images'))
-    for prompt_dir in sorted(glob.glob(os.path.join(experiment_dir, 'prompt_*'))):
+def _ensure_subset_reference_dir(
+    experiment_dir: str,
+    prompt_dirs: Sequence[str],
+    fid_reference_dir: str,
+) -> str:
+    subset_dir = os.path.join(experiment_dir, '_fid_reference_subset')
+    if os.path.exists(subset_dir):
+        shutil.rmtree(subset_dir)
+    ensure_dir(subset_dir)
+
+    copied_any = False
+    for prompt_dir in prompt_dirs:
+        metadata_path = os.path.join(prompt_dir, 'metadata.json')
+        if not os.path.exists(metadata_path):
+            return fid_reference_dir
+
+        metadata = load_json(metadata_path)
+        real_image_path = metadata.get('real_image_path')
+        if not real_image_path or not os.path.exists(real_image_path):
+            return fid_reference_dir
+
+        dst = os.path.join(subset_dir, os.path.basename(real_image_path))
+        _link_or_copy(real_image_path, dst)
+        copied_any = True
+
+    return subset_dir if copied_any else fid_reference_dir
+
+
+def ensure_flat_image_dir(experiment_dir: str, prompt_dirs: Optional[Sequence[str]] = None) -> str:
+    flat_dir = os.path.join(experiment_dir, '_fid_images')
+    if os.path.exists(flat_dir):
+        shutil.rmtree(flat_dir)
+    ensure_dir(flat_dir)
+
+    prompt_dirs = list(prompt_dirs) if prompt_dirs is not None else _collect_prompt_dirs(experiment_dir)
+    for prompt_dir in prompt_dirs:
         prompt_name = os.path.basename(prompt_dir)
         for image_path in sorted(glob.glob(os.path.join(prompt_dir, '*.png'))):
             flat_name = f'{prompt_name}_{os.path.basename(image_path)}'
@@ -1114,11 +1205,22 @@ def ensure_flat_image_dir(experiment_dir: str) -> str:
     return flat_dir
 
 
-def compute_fid_score(experiment_dir: str, fid_reference_dir: str) -> float:
+def compute_fid_score(
+    experiment_dir: str,
+    fid_reference_dir: str,
+    prompt_dirs: Optional[Sequence[str]] = None,
+) -> float:
     from cleanfid import fid
 
-    flat_dir = ensure_flat_image_dir(experiment_dir)
-    return float(fid.compute_fid(flat_dir, fid_reference_dir))
+    flat_dir = ensure_flat_image_dir(experiment_dir, prompt_dirs=prompt_dirs)
+    reference_dir = fid_reference_dir
+    if prompt_dirs is not None:
+        reference_dir = _ensure_subset_reference_dir(
+            experiment_dir=experiment_dir,
+            prompt_dirs=prompt_dirs,
+            fid_reference_dir=fid_reference_dir,
+        )
+    return float(fid.compute_fid(flat_dir, reference_dir))
 
 
 def evaluate_experiment_dir(
@@ -1126,9 +1228,11 @@ def evaluate_experiment_dir(
     metrics: Sequence[str],
     fid_reference_dir: Optional[str] = None,
     device: Optional[str] = None,
+    prompt_limit: Optional[int] = None,
 ) -> Dict[str, Any]:
     device = device or get_device()
-    prompt_dirs = sorted(glob.glob(os.path.join(experiment_dir, 'prompt_*')))
+    prompt_limit = _resolve_evaluation_prompt_limit(experiment_dir, prompt_limit=prompt_limit)
+    prompt_dirs = _collect_prompt_dirs(experiment_dir, prompt_limit=prompt_limit)
     if not prompt_dirs:
         raise ValueError(f'No prompt_* directories found in {experiment_dir}')
 
@@ -1168,10 +1272,16 @@ def evaluate_experiment_dir(
     if 'fid' in metrics:
         if not fid_reference_dir:
             raise ValueError('fid_reference_dir is required when requesting FID')
-        aggregate['fid'] = compute_fid_score(experiment_dir, fid_reference_dir)
+        aggregate['fid'] = compute_fid_score(
+            experiment_dir,
+            fid_reference_dir,
+            prompt_dirs=prompt_dirs,
+        )
 
     aggregate['num_prompts'] = len(result['per_prompt'])
-    aggregate['num_images'] = len(glob.glob(os.path.join(experiment_dir, 'prompt_*', '*.png')))
+    aggregate['num_images'] = sum(item['num_images'] for item in result['per_prompt'].values())
+    if prompt_limit is not None:
+        aggregate['prompt_limit'] = prompt_limit
     result['aggregate'] = aggregate
     return result
 
@@ -1504,6 +1614,7 @@ def run_validation_sweep(
         bank_path = prepared_banks[hook_point]['bank_path']
         for alpha in alphas:
             variant = 'best_steering'
+            prompt_limit = len(validation_manifest)
             config_base = {
                 'split': 'validation',
                 'variant': variant,
@@ -1516,6 +1627,7 @@ def run_validation_sweep(
                 'num_concepts': num_concepts,
                 'bank_mode': bank_mode,
                 'steering_bank_path': bank_path,
+                'evaluation_prompt_limit': prompt_limit,
                 'metrics': VALIDATION_METRICS,
             }
             experiment_dir, config_fingerprint = resolve_validation_experiment_dir(
@@ -1548,6 +1660,7 @@ def run_validation_sweep(
                     metrics=VALIDATION_METRICS,
                     fid_reference_dir=validation_reference_dir,
                     device=device,
+                    prompt_limit=prompt_limit,
                 )
                 write_metrics_json(experiment_dir, metrics_payload)
             else:
@@ -1637,6 +1750,7 @@ def run_test_evaluation(
     ]
 
     summary_rows = []
+    prompt_limit = len(test_manifest)
     for variant in variants:
         experiment_dir = os.path.join(
             output_root,
@@ -1655,6 +1769,7 @@ def run_test_evaluation(
             'bank_mode': bank_mode,
             'steering_bank_path': bank_path if variant['variant'] == 'best_steering' else None,
             'random_sv_path': random_sv_path if variant['variant'] == 'random_steering' else None,
+            'evaluation_prompt_limit': prompt_limit,
             'metrics': TEST_METRICS,
         }
         generate_images_for_manifest(
@@ -1675,6 +1790,7 @@ def run_test_evaluation(
             experiment_dir=experiment_dir,
             metrics=TEST_METRICS,
             device=device,
+            prompt_limit=prompt_limit,
         )
         write_metrics_json(experiment_dir, metrics_payload)
         summary_rows.append(
